@@ -13,7 +13,6 @@ import org.powermock.core.classloader.annotations.SuppressStaticInitializationFo
 import org.powermock.modules.junit4.PowerMockRunner;
 
 import java.net.URI;
-import java.util.Map;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -51,27 +50,6 @@ public class OneAgentSDKUtilsTest {
         when(message.get("http.headers")).thenReturn(headerSet);
         String host = OneAgentSDKUtils.readHostNameFromHttpHeader(message);
         Assert.assertEquals("10.129.61.129", host);
-    }
-
-    @Test
-    public void testMultiValueHeader() {
-        HeaderSet headerSet = new HeaderSet();
-        headerSet.addHeader("Cf-Visitor", "scheme");
-        headerSet.addHeader("Cf-Visitor", "https");
-        for (Map.Entry<String, HeaderSet.HeaderEntry> entry : headerSet.entrySet()) {
-            String value = OneAgentSDKUtils.getHeaderValues(entry);
-            Assert.assertEquals("scheme,https", value);
-        }
-    }
-
-    @Test
-    public void testSingleHeader() {
-        HeaderSet headerSet = new HeaderSet();
-        headerSet.addHeader("Host", "10.129.61.129");
-        for (Map.Entry<String, HeaderSet.HeaderEntry> entry : headerSet.entrySet()) {
-            String value = OneAgentSDKUtils.getHeaderValues(entry);
-            Assert.assertEquals("10.129.61.129", value);
-        }
     }
 
     @Test

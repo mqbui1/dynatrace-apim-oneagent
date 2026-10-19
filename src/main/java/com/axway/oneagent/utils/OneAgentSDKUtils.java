@@ -2,27 +2,66 @@ package com.axway.oneagent.utils;
 
 import com.axway.aspects.apim.TraceLoggingCallback;
 import com.dynatrace.oneagent.sdk.OneAgentSDKFactory;
-import com.dynatrace.oneagent.sdk.api.IncomingWebRequestTracer;
 import com.dynatrace.oneagent.sdk.api.OneAgentSDK;
-import com.dynatrace.oneagent.sdk.api.OutgoingWebRequestTracer;
-import com.dynatrace.oneagent.sdk.api.infos.WebApplicationInfo;
 import com.vordel.circuit.Message;
 import com.vordel.circuit.MessageProperties;
 import com.vordel.config.Circuit;
 import com.vordel.dwe.CorrelationID;
 import com.vordel.mime.HeaderSet;
 import com.vordel.trace.Trace;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.context.propagation.TextMapGetter;
+import io.opentelemetry.context.propagation.TextMapSetter;
+import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
+import io.opentelemetry.sdk.resources.Resource;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import org.aspectj.lang.ProceedingJoinPoint;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 public class OneAgentSDKUtils {
     private static final OneAgentSDK oneAgentSdk = OneAgentSDKFactory.createInstance();
     private static final String DEFAULT = "default";
     public static final String AXWAY_CORRELATION_ID = "AxwayCorrelationId";
     public static final String HTTP_HEADERS = "http.headers";
+
+    // OTEL-003: OTel SDK bootstrap, mirroring the Dynatrace OneAgentSDKFactory static-singleton
+    // pattern above. Both SDKs coexist during the OTel migration -- the Dynatrace singleton is
+    // left untouched.
+    private static final String OTEL_SERVICE_NAME = "dynatrace-apim-oneagent";
+    private static final SdkTracerProvider otelTracerProvider = buildOtelTracerProvider();
+    private static Tracer otelTracer = otelTracerProvider.get(OTEL_SERVICE_NAME);
+
+    private static final TextMapGetter<HeaderSet> HEADER_GETTER = new TextMapGetter<HeaderSet>() {
+        @Override
+        public Iterable<String> keys(HeaderSet carrier) {
+            List<String> keys = new ArrayList<>();
+            for (Map.Entry<String, HeaderSet.HeaderEntry> entry : carrier.entrySet()) {
+                keys.add(entry.getKey());
+            }
+            return keys;
+        }
+
+        @Override
+        public String get(HeaderSet carrier, String key) {
+            return carrier == null ? null : carrier.getHeader(key);
+        }
+    };
+
+    private static final TextMapSetter<HeaderSet> HEADER_SETTER =
+        (carrier, key, value) -> carrier.setHeader(key, value);
 
     static {
         oneAgentSdk.setLoggingCallback(new TraceLoggingCallback());
@@ -46,39 +85,95 @@ public class OneAgentSDKUtils {
         /* This utility class should not be instantiated */
     }
 
+    private static SdkTracerProvider buildOtelTracerProvider() {
+        OtlpHttpSpanExporter exporter = OtlpHttpSpanExporter.builder()
+            .setEndpoint(resolveOtlpTracesEndpoint())
+            .build();
+        Resource resource = Resource.getDefault().merge(
+            Resource.create(Attributes.of(AttributeKey.stringKey("service.name"), OTEL_SERVICE_NAME)));
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+            .setResource(resource)
+            .addSpanProcessor(BatchSpanProcessor.builder(exporter).build())
+            .build();
+        Runtime.getRuntime().addShutdownHook(new Thread(provider::close));
+        return provider;
+    }
+
+    private static String resolveOtlpTracesEndpoint() {
+        String configured = firstNonBlank(
+            System.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+            System.getProperty("otel.exporter.otlp.traces.endpoint"),
+            System.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            System.getProperty("otel.exporter.otlp.endpoint"));
+        if (configured == null) {
+            return "http://localhost:4318/v1/traces";
+        }
+        return configured.endsWith("/v1/traces") ? configured : configured + "/v1/traces";
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isEmpty()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    /** Static accessor required by OTEL-003's acceptance criteria: created exactly once per JVM. */
+    public static Tracer getOtelTracer() {
+        return otelTracer;
+    }
+
+    public static SdkTracerProvider getOtelTracerProvider() {
+        return otelTracerProvider;
+    }
+
+    /**
+     * Test-only seam: lets focused tests swap in a Tracer backed by an in-memory span exporter
+     * so span attributes/parentage/status can be asserted without a live OTLP collector. Never
+     * called from production code paths.
+     */
+    static void setOtelTracerForTests(Tracer tracer) {
+        otelTracer = tracer;
+    }
+
     public static Object aroundProducer(ProceedingJoinPoint pjp, Message message, Circuit circuit, HeaderSet requestHeaders, String httpVerb) throws Throwable {
         Trace.debug("Dynatrace :: Starting around producer for Policy " + circuit.getName());
         Object object;
-        OutgoingWebRequestTracer outgoingWebRequestTracer = createOutgoingWebRequestTracer(message, httpVerb);
-        try {
+        // Remediation: this OTel CLIENT span fully replaces the former Dynatrace
+        // OutgoingWebRequestTracer (the flagged traceOutgoingWebRequest call site).
+        String otelUrl = getRequestURL(message);
+        Span otelSpan = getOtelTracer().spanBuilder("API Manager/Gateway outbound backend call")
+            .setSpanKind(SpanKind.CLIENT)
+            .setAttribute(AttributeKey.stringKey("http.request.method"), httpVerb)
+            .setAttribute(AttributeKey.stringKey("url.full"), otelUrl)
+            .startSpan();
+        try (Scope otelScope = otelSpan.makeCurrent()) {
             String appName = (String) message.getOrDefault("authentication.application.name", DEFAULT);
             String orgName = (String) message.getOrDefault("authentication.organization.name", DEFAULT);
             String appId = (String) message.getOrDefault("authentication.subject.id", DEFAULT);
-            addOutgoingRequestHeaders(outgoingWebRequestTracer, requestHeaders);
-            outgoingWebRequestTracer.start();
             addRequestAttributes(appName, orgName, appId, message.getIDBase());
-            String outgoingTag = outgoingWebRequestTracer.getDynatraceStringTag();
-            Trace.debug("Dynatrace :: outgoing x-dynatrace header " + outgoingTag);
             if (requestHeaders != null) {
-                if (requestHeaders.containsKey(OneAgentSDK.DYNATRACE_HTTP_HEADERNAME)) {
-                    requestHeaders.remove(OneAgentSDK.DYNATRACE_HTTP_HEADERNAME);
-                }
-                requestHeaders.setHeader(OneAgentSDK.DYNATRACE_HTTP_HEADERNAME, outgoingTag);
+                // W3C traceparent is now the sole outbound propagation mechanism -- the
+                // x-dynatrace tag this used to carry came from the removed
+                // OutgoingWebRequestTracer and has no replacement source.
+                W3CTraceContextPropagator.getInstance()
+                    .inject(Context.current(), requestHeaders, HEADER_SETTER);
             }
             addAttributes(message);
             object = pjp.proceed();
-            HeaderSet responseHeaders = (HeaderSet) message.get(HTTP_HEADERS);
-            addOutgoingResponseHeaders(outgoingWebRequestTracer, responseHeaders);
             int httpStatusCode = getHTTPStatusCode(message);
-            outgoingWebRequestTracer.setStatusCode(httpStatusCode);
+            otelSpan.setAttribute(AttributeKey.longKey("http.response.status_code"), httpStatusCode);
             Trace.debug("Dynatrace :: Backend response code " + httpStatusCode);
         } catch (Throwable e) {
             Trace.error("Dynatrace :: around producer ", e);
-            outgoingWebRequestTracer.setStatusCode(500);
-            outgoingWebRequestTracer.error(e);
+            otelSpan.setAttribute(AttributeKey.longKey("http.response.status_code"), 500);
+            otelSpan.recordException(e);
+            otelSpan.setStatus(StatusCode.ERROR);
             throw e;
         } finally {
-            outgoingWebRequestTracer.end();
+            otelSpan.end();
         }
         return object;
     }
@@ -86,19 +181,25 @@ public class OneAgentSDKUtils {
     public static Object aroundConsumer(ProceedingJoinPoint pjp, Message message, String apiName, String apiContextRoot) throws Throwable {
         Trace.debug("Dynatrace :: Starting around consumer");
         Object pjpProceed;
-        WebApplicationInfo wsInfo = oneAgentSdk.createWebApplicationInfo("Axway Gateway", apiName, apiContextRoot);
         HeaderSet headers = (HeaderSet) message.get(HTTP_HEADERS);
         String correlationId = message.getIDBase().toString();
         Trace.debug("Dynatrace :: Consumer Headers before proceed: " + headers);
-        IncomingWebRequestTracer tracer = createIncomingWebRequestTracer(message, wsInfo);
+        // Remediation: this OTel SERVER span fully replaces the former Dynatrace
+        // IncomingWebRequestTracer (the flagged traceIncomingWebRequest call site),
+        // correctly parented to the caller's W3C traceparent when present.
+        Context parentOtelContext = W3CTraceContextPropagator.getInstance()
+            .extract(Context.root(), headers, HEADER_GETTER);
+        Object httpVerb = message.get("http.request.verb");
+        Span otelSpan = getOtelTracer().spanBuilder("API Manager/Gateway consumer request")
+            .setParent(parentOtelContext)
+            .setSpanKind(SpanKind.SERVER)
+            .setAttribute(AttributeKey.stringKey("http.request.method"), httpVerb == null ? null : httpVerb.toString())
+            .setAttribute(AttributeKey.stringKey("url.path"), apiContextRoot)
+            .startSpan();
+        Scope otelScope = otelSpan.makeCurrent();
         if (headers != null && headers.hasHeader(OneAgentSDK.DYNATRACE_HTTP_HEADERNAME)) {
             String receivedTag = headers.getHeader(OneAgentSDK.DYNATRACE_HTTP_HEADERNAME);
             Trace.debug("Dynatrace :: X-Dynatrace-Header " + receivedTag);
-            tracer.setDynatraceStringTag(receivedTag);
-            addIncomingHeaders(tracer, headers);
-            tracer.start();
-            if (correlationId != null)
-                oneAgentSdk.addCustomRequestAttribute(AXWAY_CORRELATION_ID, "Id-" + correlationId);
             if (!receivedTag.startsWith("FW")) {
                 int naIndex = receivedTag.indexOf("NA=");
                 int snIndex = receivedTag.indexOf("SN=");
@@ -118,46 +219,56 @@ public class OneAgentSDKUtils {
                     neoloadTraffic(neoloadTraffic);
                 }
             }
-        } else {
-            addIncomingHeaders(tracer, headers);
-            tracer.start();
-            oneAgentSdk.addCustomRequestAttribute(AXWAY_CORRELATION_ID, "Id-" + correlationId);
         }
         try {
             pjpProceed = pjp.proceed();
         } catch (Throwable e) {
             Trace.error("Dynatrace :: around consumer", e);
-            tracer.error(e);
+            otelSpan.recordException(e);
+            otelSpan.setStatus(StatusCode.ERROR);
             throw e;
         } finally {
             String appName = getStringOrDefault(message, "authentication.application.name", DEFAULT);
             String orgName = getStringOrDefault(message, "authentication.organization.name", DEFAULT);
             String appId = getStringOrDefault(message, "authentication.subject.id", DEFAULT);
             String serviceName = getStringOrDefault(message, "service.name", DEFAULT);
-            if (serviceName != null)
-                oneAgentSdk.addCustomRequestAttribute("ServiceName", serviceName);
             addRequestAttributes(appName, orgName, appId, message.getIDBase());
-            if (message.get(MessageProperties.RESTAPI_ERROR_REASON) != null) {
-                oneAgentSdk.addCustomRequestAttribute("RestApiErrorReason", (String) message.get(MessageProperties.RESTAPI_ERROR_REASON));
-                oneAgentSdk.addCustomRequestAttribute("RestApiErrorSource", getStringOrDefault(message, MessageProperties.RESTAPI_ERROR_SOURCE, ""));
+            setOtelRequestAttributes(otelSpan, appName, orgName, appId, correlationId);
+            if (serviceName != null) {
+                otelSpan.setAttribute(AttributeKey.stringKey("ServiceName"), serviceName);
             }
-            tracer.setStatusCode(getHTTPStatusCode(message));
-            tracer.end();
+            if (message.get(MessageProperties.RESTAPI_ERROR_REASON) != null) {
+                String restApiErrorReason = (String) message.get(MessageProperties.RESTAPI_ERROR_REASON);
+                String restApiErrorSource = getStringOrDefault(message, MessageProperties.RESTAPI_ERROR_SOURCE, "");
+                otelSpan.setAttribute(AttributeKey.stringKey("RestApiErrorReason"), restApiErrorReason);
+                otelSpan.setAttribute(AttributeKey.stringKey("RestApiErrorSource"), restApiErrorSource);
+            }
+            int httpStatusCode = getHTTPStatusCode(message);
+            otelSpan.setAttribute(AttributeKey.longKey("http.response.status_code"), httpStatusCode);
+            otelScope.close();
+            otelSpan.end();
             Trace.debug("Dynatrace :: Ending around consumer");
         }
         return pjpProceed;
     }
 
-    private static IncomingWebRequestTracer createIncomingWebRequestTracer(Message m, WebApplicationInfo wsInfo) {
-        String httpURL = "https://" + readHostNameFromHttpHeader(m) + m.get("http.request.uri").toString();
-        return oneAgentSdk.traceIncomingWebRequest(wsInfo, httpURL, m.get("http.request.verb").toString());
+    /** Carries over AxwayAppName/AxwayOrgName/AxwayAppId/AxwayCorrelationId to the OTel span,
+     * only when they differ from the DEFAULT sentinel -- matching addRequestAttributes' existing
+     * behavior for the Dynatrace tracer. */
+    private static void setOtelRequestAttributes(Span otelSpan, String appName, String orgName, String appId, String correlationId) {
+        if (appName != null && !appName.equals(DEFAULT)) {
+            otelSpan.setAttribute(AttributeKey.stringKey("AxwayAppName"), appName);
+        }
+        if (orgName != null && !orgName.equals(DEFAULT)) {
+            otelSpan.setAttribute(AttributeKey.stringKey("AxwayOrgName"), orgName);
+        }
+        if (appId != null && !appId.equals(DEFAULT)) {
+            otelSpan.setAttribute(AttributeKey.stringKey("AxwayAppId"), appId);
+        }
+        if (correlationId != null) {
+            otelSpan.setAttribute(AttributeKey.stringKey(AXWAY_CORRELATION_ID), "Id-" + correlationId);
+        }
     }
-
-    private static OutgoingWebRequestTracer createOutgoingWebRequestTracer(Message m, String httpVerb) {
-        String httpURL = getRequestURL(m);
-        return oneAgentSdk.traceOutgoingWebRequest(httpURL, httpVerb);
-    }
-
 
     public static String readHostNameFromHttpHeader(Message message) {
         HeaderSet httpHeaders = (HeaderSet) message.get(HTTP_HEADERS);
@@ -186,19 +297,19 @@ public class OneAgentSDKUtils {
     }
 
     public static void neoLoadTransaction(String value) {
-        oneAgentSdk.addCustomRequestAttribute("NeoLoad_Transaction", value);
+        Span.current().setAttribute("NeoLoad_Transaction", value);
     }
 
     public static void neoLoadUserPath(String value) {
-        oneAgentSdk.addCustomRequestAttribute("NeoLoad_UserPath", value);
+        Span.current().setAttribute("NeoLoad_UserPath", value);
     }
 
     public static void neoloadTraffic(String value) {
-        oneAgentSdk.addCustomRequestAttribute("Neoload_Traffic", value);
+        Span.current().setAttribute("Neoload_Traffic", value);
     }
 
     public static void addClientName(String clientName) {
-        oneAgentSdk.addCustomRequestAttribute("ClientName", clientName);
+        Span.current().setAttribute("ClientName", clientName);
     }
 
 
@@ -218,39 +329,6 @@ public class OneAgentSDKUtils {
             return "https://" + readHostNameFromHttpHeader(message) + "/";
         }
         return messageObject.toString();
-    }
-
-    public static void addIncomingHeaders(IncomingWebRequestTracer tracer, HeaderSet headers) {
-        if (headers != null) {
-            for (Map.Entry<String, HeaderSet.HeaderEntry> entry : headers.entrySet()) {
-                String value = getHeaderValues(entry);
-                tracer.addRequestHeader(entry.getKey(), value);
-            }
-        }
-    }
-
-    public static String getHeaderValues(Map.Entry<String, HeaderSet.HeaderEntry> entry) {
-        return entry.getValue().stream().
-            map(Object::toString).
-            collect(Collectors.joining(","));
-    }
-
-    public static void addOutgoingRequestHeaders(OutgoingWebRequestTracer outgoingWebRequestTracer, HeaderSet headers) {
-        if (headers != null) {
-            for (Map.Entry<String, HeaderSet.HeaderEntry> entry : headers.entrySet()) {
-                String value = getHeaderValues(entry);
-                outgoingWebRequestTracer.addRequestHeader(entry.getKey(), value);
-            }
-        }
-    }
-
-    public static void addOutgoingResponseHeaders(OutgoingWebRequestTracer outgoingWebRequestTracer, HeaderSet headers) {
-        if (headers != null) {
-            for (Map.Entry<String, HeaderSet.HeaderEntry> entry : headers.entrySet()) {
-                String value = getHeaderValues(entry);
-                outgoingWebRequestTracer.addResponseHeader(entry.getKey(), value);
-            }
-        }
     }
 
     public static void addRequestAttributes(String appName, String orgName, String appId, CorrelationID correlationId) {

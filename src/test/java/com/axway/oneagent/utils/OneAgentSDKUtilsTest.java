@@ -67,16 +67,16 @@ public class OneAgentSDKUtilsTest {
     @Test
     public void testResponseCode() {
         Message message = mock(Message.class);
-        when(message.getOrDefault("http.response.status", 500)).thenReturn(200);
+        when(message.get("http.response.status")).thenReturn(200);
         Assert.assertEquals(200, OneAgentSDKUtils.getHTTPStatusCode(message));
-        when(message.getOrDefault("http.response.status", 500)).thenReturn(500);
+        when(message.get("http.response.status")).thenReturn(500);
         Assert.assertEquals(500, OneAgentSDKUtils.getHTTPStatusCode(message));
     }
 
     @Test
     public void checkURL() {
         Message message = mock(Message.class);
-        Assert.assertEquals("/", OneAgentSDKUtils.getRequestURL(message));
+        Assert.assertEquals("https://0.0.0.0/", OneAgentSDKUtils.getRequestURL(message));
     }
 
 

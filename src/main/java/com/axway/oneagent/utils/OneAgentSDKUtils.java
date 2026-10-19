@@ -6,7 +6,6 @@ import com.dynatrace.oneagent.sdk.api.OneAgentSDK;
 import com.vordel.circuit.Message;
 import com.vordel.circuit.MessageProperties;
 import com.vordel.config.Circuit;
-import com.vordel.dwe.CorrelationID;
 import com.vordel.mime.HeaderSet;
 import com.vordel.trace.Trace;
 import io.opentelemetry.api.common.AttributeKey;
@@ -27,7 +26,6 @@ import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import org.aspectj.lang.ProceedingJoinPoint;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -153,7 +151,8 @@ public class OneAgentSDKUtils {
             String appName = (String) message.getOrDefault("authentication.application.name", DEFAULT);
             String orgName = (String) message.getOrDefault("authentication.organization.name", DEFAULT);
             String appId = (String) message.getOrDefault("authentication.subject.id", DEFAULT);
-            addRequestAttributes(appName, orgName, appId, message.getIDBase());
+            Object idBase = message.getIDBase();
+            setOtelRequestAttributes(otelSpan, appName, orgName, appId, idBase == null ? null : idBase.toString());
             if (requestHeaders != null) {
                 // W3C traceparent is now the sole outbound propagation mechanism -- the
                 // x-dynatrace tag this used to carry came from the removed
@@ -232,7 +231,6 @@ public class OneAgentSDKUtils {
             String orgName = getStringOrDefault(message, "authentication.organization.name", DEFAULT);
             String appId = getStringOrDefault(message, "authentication.subject.id", DEFAULT);
             String serviceName = getStringOrDefault(message, "service.name", DEFAULT);
-            addRequestAttributes(appName, orgName, appId, message.getIDBase());
             setOtelRequestAttributes(otelSpan, appName, orgName, appId, correlationId);
             if (serviceName != null) {
                 otelSpan.setAttribute(AttributeKey.stringKey("ServiceName"), serviceName);
@@ -331,25 +329,4 @@ public class OneAgentSDKUtils {
         return messageObject.toString();
     }
 
-    public static void addRequestAttributes(String appName, String orgName, String appId, CorrelationID correlationId) {
-        Map<String, String> map = new HashMap<>();
-        if (appName != null && !appName.equals(DEFAULT)) {
-            map.put("AxwayAppName", appName);
-        }
-        if (orgName != null && !orgName.equals(DEFAULT)) {
-            map.put("AxwayOrgName", orgName);
-        }
-        if (appId != null && !appId.equals(DEFAULT)) {
-            map.put("AxwayAppId", appId);
-        }
-        if (correlationId != null) {
-            map.put(AXWAY_CORRELATION_ID, "Id-" + correlationId);
-        }
-        Trace.debug("Dynatrace :: Application Id :" + appId + " - Application Name : " + appName);
-        addRequestAttributes(map);
-    }
-
-    public static void addRequestAttributes(Map<String, String> attributes) {
-        attributes.forEach(oneAgentSdk::addCustomRequestAttribute);
-    }
 }
